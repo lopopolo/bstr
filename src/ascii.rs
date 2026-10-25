@@ -7,9 +7,8 @@
 // a very similar problem to memchr, and virtually nobody has been able to
 // resist optimizing the crap out of that (except for perhaps the BSD and MUSL
 // folks). In particular, this routine makes a very common case (ASCII) very
-// fast, which seems worth it. We do stop short of adding AVX variants of the
-// code below in order to retain our sanity and also to avoid needing to deal
-// with runtime target feature detection. RESIST!
+// fast, which seems worth it. AVX2 is selected only when enabled for the
+// compilation target, without runtime target feature detection.
 //
 // In order to understand the SIMD version below, it would be good to read this
 // comment describing how my memchr routine works:
@@ -141,6 +140,14 @@ fn first_non_ascii_byte_sse2(slice: &[u8]) -> usize {
         debug_assert!(ptr > start_ptr);
         debug_assert!(end_ptr.sub(VECTOR_SIZE) >= start_ptr);
         if slice.len() >= VECTOR_LOOP_SIZE {
+            // Keep short scans on the established SSE2 path. Only targets
+            // compiled with AVX2 can delegate longer inputs to the wide loop.
+            #[cfg(target_feature = "avx2")]
+            if slice.len() >= 1024 {
+                // SAFETY: The target enables AVX2 and the length check
+                // satisfies the wide loop's 64-byte precondition.
+                return first_non_ascii_byte_avx2(slice);
+            }
             while ptr <= ptr_sub(end_ptr, VECTOR_LOOP_SIZE) {
                 debug_assert_eq!(0, (ptr as usize) % VECTOR_SIZE);
 
@@ -196,6 +203,109 @@ fn first_non_ascii_byte_sse2(slice: &[u8]) -> usize {
         if ptr < end_ptr {
             let last = end_ptr.sub(VECTOR_SIZE);
             let mask = _mm_movemask_epi8(_mm_loadu_si128(last.cast()));
+            if mask != 0 {
+                return sub(last, start_ptr) + mask.trailing_zeros() as usize;
+            }
+        }
+        slice.len()
+    }
+}
+
+// The AVX2 kernel uses 32-byte vectors and 128-byte blocks.
+// SAFETY: Its caller must guarantee AVX2 and at least 64 input bytes.
+// Two initial unaligned loads advance to a 32-byte-aligned main loop.
+// Later loop bounds and the overlapping tail keep every load in the slice.
+#[cfg(all(
+    not(miri),
+    target_arch = "x86_64",
+    any(test, target_feature = "avx2"),
+))]
+#[target_feature(enable = "avx2")]
+unsafe fn first_non_ascii_byte_avx2(slice: &[u8]) -> usize {
+    use core::arch::x86_64::*;
+
+    const VECTOR_SIZE: usize = core::mem::size_of::<__m256i>();
+    const VECTOR_ALIGN: usize = VECTOR_SIZE - 1;
+    const VECTOR_LOOP_SIZE: usize = 4 * VECTOR_SIZE;
+
+    let start_ptr = slice.as_ptr();
+    let end_ptr = slice[slice.len()..].as_ptr();
+    let mut ptr = start_ptr;
+
+    unsafe {
+        debug_assert!(slice.len() >= 2 * VECTOR_SIZE);
+
+        let chunk = _mm256_loadu_si256(ptr.cast());
+        let mask = _mm256_movemask_epi8(chunk);
+        if mask != 0 {
+            return mask.trailing_zeros() as usize;
+        }
+
+        // Check the next vector before the bulk loop. This avoids scanning
+        // a whole block for the short ASCII runs common in mixed UTF-8.
+        let chunk = _mm256_loadu_si256(ptr.add(VECTOR_SIZE).cast());
+        let mask = _mm256_movemask_epi8(chunk);
+        if mask != 0 {
+            return VECTOR_SIZE + mask.trailing_zeros() as usize;
+        }
+
+        ptr = ptr.add(2 * VECTOR_SIZE - (start_ptr as usize & VECTOR_ALIGN));
+        debug_assert!(ptr > start_ptr);
+        debug_assert!(end_ptr.sub(VECTOR_SIZE) >= start_ptr);
+        if slice.len() >= VECTOR_LOOP_SIZE {
+            while ptr <= ptr_sub(end_ptr, VECTOR_LOOP_SIZE) {
+                debug_assert_eq!(0, (ptr as usize) % VECTOR_SIZE);
+
+                let a = _mm256_load_si256(ptr.cast());
+                let b = _mm256_load_si256(ptr.add(VECTOR_SIZE).cast());
+                let c = _mm256_load_si256(ptr.add(2 * VECTOR_SIZE).cast());
+                let d = _mm256_load_si256(ptr.add(3 * VECTOR_SIZE).cast());
+
+                let or1 = _mm256_or_si256(a, b);
+                let or2 = _mm256_or_si256(c, d);
+                let or3 = _mm256_or_si256(or1, or2);
+                if _mm256_movemask_epi8(or3) != 0 {
+                    let mut at = sub(ptr, start_ptr);
+                    let mask = _mm256_movemask_epi8(a);
+                    if mask != 0 {
+                        return at + mask.trailing_zeros() as usize;
+                    }
+
+                    at += VECTOR_SIZE;
+                    let mask = _mm256_movemask_epi8(b);
+                    if mask != 0 {
+                        return at + mask.trailing_zeros() as usize;
+                    }
+
+                    at += VECTOR_SIZE;
+                    let mask = _mm256_movemask_epi8(c);
+                    if mask != 0 {
+                        return at + mask.trailing_zeros() as usize;
+                    }
+
+                    at += VECTOR_SIZE;
+                    let mask = _mm256_movemask_epi8(d);
+                    debug_assert!(mask != 0);
+                    return at + mask.trailing_zeros() as usize;
+                }
+                ptr = ptr_add(ptr, VECTOR_LOOP_SIZE);
+            }
+        }
+        while ptr <= end_ptr.sub(VECTOR_SIZE) {
+            debug_assert!(sub(end_ptr, ptr) >= VECTOR_SIZE);
+
+            let chunk = _mm256_loadu_si256(ptr.cast());
+            let mask = _mm256_movemask_epi8(chunk);
+            if mask != 0 {
+                return sub(ptr, start_ptr) + mask.trailing_zeros() as usize;
+            }
+            ptr = ptr.add(VECTOR_SIZE);
+        }
+        // The initial length check guarantees a full vector. This load
+        // ends at end_ptr and overlaps only bytes already checked as ASCII.
+        if ptr < end_ptr {
+            let last = end_ptr.sub(VECTOR_SIZE);
+            let mask = _mm256_movemask_epi8(_mm256_loadu_si256(last.cast()));
             if mask != 0 {
                 return sub(last, start_ptr) + mask.trailing_zeros() as usize;
             }
@@ -376,6 +486,72 @@ mod tests {
                     s.len(),
                     s
                 );
+            }
+        }
+    }
+    #[cfg(all(not(miri), target_arch = "x86_64"))]
+    mod avx2 {
+        use super::super::*;
+
+        fn check_x86_kernel(scan: unsafe fn(&[u8]) -> usize, min_len: usize) {
+            for align in 0..64 {
+                for len in min_len..=257 {
+                    // Include NUL as ordinary ASCII input.
+                    let mut bytes = std::vec![0; align + len];
+                    assert_eq!(unsafe { scan(&bytes[align..]) }, len);
+                    for at in 0..len {
+                        for byte in [0x80, 0xFF] {
+                            bytes[align + at] = byte;
+                            assert_eq!(unsafe { scan(&bytes[align..]) }, at,
+                                "align: {align}, len: {len}, at: {at}, byte: {byte}");
+                        }
+                        bytes[align + at] = 0;
+                    }
+                }
+            }
+            for byte in 0u8..=255 {
+                let bytes = [byte; 513];
+                let expected = if byte <= 0x7F { bytes.len() } else { 0 };
+                assert_eq!(unsafe { scan(&bytes) }, expected);
+            }
+            for first in 0..257 {
+                let mut bytes = std::vec![0x7F; 513];
+                bytes[first] = 0x80;
+                bytes[first + 16] = 0xFF;
+                bytes[first + 128] = 0x81;
+                assert_eq!(unsafe { scan(&bytes) }, first);
+            }
+        }
+
+        #[test]
+        fn avx2_matches_scalar() {
+            if !std::is_x86_feature_detected!("avx2") {
+                return;
+            }
+            check_x86_kernel(first_non_ascii_byte_avx2, 64);
+        }
+
+        #[test]
+        fn x86_dispatch_matches_scalar() {
+            check_x86_kernel(first_non_ascii_byte, 0);
+        }
+
+        #[test]
+        fn large_dispatch_matches_scalar() {
+            for len in [1023, 1024, 1025, 1151, 1152, 1153, 2048] {
+                for align in 0..64 {
+                    let mut bytes = std::vec![0x7F; align + len];
+                    assert_eq!(first_non_ascii_byte(&bytes[align..]), len);
+                    for at in 0..len {
+                        bytes[align + at] = 0x80;
+                        assert_eq!(
+                            first_non_ascii_byte(&bytes[align..]),
+                            at,
+                            "align: {align}, len: {len}, at: {at}"
+                        );
+                        bytes[align + at] = 0x7F;
+                    }
+                }
             }
         }
     }
